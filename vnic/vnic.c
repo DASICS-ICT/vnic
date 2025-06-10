@@ -13,22 +13,19 @@ static netdev_tx_t vnic_start_xmit(struct sk_buff *skb, struct net_device *dev)
             return NETDEV_TX_OK;
         }
     }
-
-    vnic_send_packet(skb);
     
     pr_info("vnic_start_xmit: dev = %llx, tx_packets %llx, tx_bytes = %llx\n", 
            (unsigned long long)dev, (unsigned long long)dev->stats.tx_packets,
            (unsigned long long)dev->stats.tx_bytes);
     //if (skb)
     //    dev_kfree_skb(skb);
-
-    return NETDEV_TX_OK;
+    return vnic_send_packet(skb);
 }
 
 static int vnic_poll_rx(void *data)
 {
     int ret;
-    while (!kthread_should_stop()) { // 检查线程是否应停止
+    while (!kthread_should_stop() && vnic_opened) { // 检查线程是否应停止
         ret = vnic_recv_packet();       
         if (ret < 0) {
             pr_err("Failed to receive packet: %d\n", ret);
@@ -46,6 +43,7 @@ static int vnic_open(struct net_device *dev)
 {
     pr_info("open vnic\n");
     netif_start_queue(dev);
+    vnic_opened = true;
     return 0;
 }
 
@@ -53,6 +51,7 @@ static int vnic_close(struct net_device *dev)
 {
     pr_info("close vnic\n");
     netif_stop_queue(dev);
+    vnic_opened = false;
     return 0;
 }
 
@@ -74,7 +73,7 @@ static void vnic_setup(struct net_device *dev)
     /* random mac */
     //eth_random_addr(dev->dev_addr);
     /* manually set mac address */
-    #ifdef fpga
+    #ifdef FPGA
         memcpy(dev->dev_addr, "\x01\x02\x03\x04\x05\x06", ETH_ALEN);
     #else
         memcpy(dev->dev_addr, "\x11\x22\x33\x44\x55\x66", ETH_ALEN);
@@ -118,7 +117,7 @@ static void __exit vnic_exit(void)
     unregister_netdev(vnic_dev);
     free_netdev(vnic_dev);
     if (polling_thread) {
-        kthread_stop(polling_thread); // 停止线程
+        kthread_stop(polling_thread);
         polling_thread = NULL;
     }
     vnic_deinit_share_mem();
