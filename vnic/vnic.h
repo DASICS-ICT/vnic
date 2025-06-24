@@ -14,6 +14,17 @@
 
 #define DRV_NAME "vnic"
 
+uint64_t fail_count = 0;
+
+bool debug = true;
+
+#define VNIC_DBG(fmt, ...) \
+    do { \
+        if (debug) { \
+            pr_info(DRV_NAME ": " fmt, ##__VA_ARGS__); \
+        } \
+    } while (0)
+
 #ifdef FPGA
     #include <asm/kdasics.h>
 #else
@@ -24,31 +35,31 @@
     share mem layout
     totally 128MB, 64MB for fpga and 64MB for host
     fpga tx == host rx, fpga rx == host tx
-    +---------------------------+ base (0xfc000000)
+    +---------------------------+ base (0xf8000000)
     |         fpga tx tail        |
     |           64-bit            |
-    +---------------------------+ base + 8B (0xfc000008)
+    +---------------------------+ base + 8B (0xf8000008)
     |         fpga tx head        |
     |           64-bit            |
-    +---------------------------+ base + 16B (0xfc000010)
+    +---------------------------+ base + 16B (0xf8000010)
     |     fpga tx metadata fifo   |
     |          32B * 1024         |
-    +---------------------------+ base + 16KB (0xfc004000)
+    +---------------------------+ base + 16KB (0xf8004000)
     |       fpga tx data fifo     |
     |          4KB * 1024         |
-    +---------------------------+ base + 64MB (0x100000000)
+    +---------------------------+ base + 64MB (0xfc000000)
     |         host tx tail        |
     |           64-bit            |
-    +---------------------------+ base + 64MB + 8B (0x100000008)
+    +---------------------------+ base + 64MB + 8B (0xfc000008)
     |         host tx head        |
     |           64-bit            |
-    +---------------------------+ base + 64MB + 16B (0x100000010)
+    +---------------------------+ base + 64MB + 16B (0xfc000010)
     |       host tx metadata fifo |
     |          32B * 1024         |
-    +---------------------------+ base + 64MB + 16KB (0x100004000)
+    +---------------------------+ base + 64MB + 16KB (0xfc004000)
     |       host tx data fifo     |
     |          4KB * 1024         |
-    +---------------------------+ base + 128MB (0x104000000)
+    +---------------------------+ base + 128MB (0x100000000)
 */
 
 /* metadata format
@@ -57,7 +68,7 @@ static struct metadata {
     uint64_t len;
     uint64_t valid;
     uint64_t reserved;
-} medata;
+} metadata;
 */
 
 #define FPGA_TX_TAIL_OFFSET 0x0
@@ -69,6 +80,8 @@ static struct metadata {
 #define HOST_TX_MD_FIFO_OFFSET (1 << 26) + 0x10
 #define HOST_TX_D_FIFO_OFFSET (1 << 26) + (1 << 14) // 64MB + 16KB
 
+#define XDMA_BAR_BASE 0x50000000UL
+
 #ifdef FPGA
     #define TX_TAIL_OFFSET FPGA_TX_TAIL_OFFSET
     #define TX_HEAD_OFFSET FPGA_TX_HEAD_OFFSET
@@ -79,7 +92,8 @@ static struct metadata {
     #define RX_MD_FIFO_OFFSET HOST_TX_MD_FIFO_OFFSET
     #define RX_D_FIFO_OFFSET HOST_TX_D_FIFO_OFFSET
 #else
-    #define SHARE_MEM_BASE 0xfc000000 // FPGA reserved memory base address
+    //#define SHARE_MEM_BASE 0xf8000000 // FPGA reserved memory base address
+    #define SHARE_MEM_BASE (XDMA_BAR_BASE + 0x8000000UL)
     #define TX_TAIL_OFFSET HOST_TX_TAIL_OFFSET
     #define TX_HEAD_OFFSET HOST_TX_HEAD_OFFSET
     #define TX_MD_FIFO_OFFSET HOST_TX_MD_FIFO_OFFSET
@@ -90,20 +104,26 @@ static struct metadata {
     #define RX_D_FIFO_OFFSET FPGA_TX_D_FIFO_OFFSET
 #endif
 
-#define MAX_DESC 1024
-#define MAX_PACKET_SIZE (1 << 12)
+#define MAX_DESC 0x400UL
+#define DESC_SIZE 0x20UL // 4 * 8B for metadata
+#define MAX_PACKET_SIZE 0x1000UL
 
 static bool vnic_opened = false;
 
 static void __iomem *share_mem_virt;
-static uint64_t *tx_tail;
-static uint64_t *tx_head;
-static uint64_t *tx_md;
-static void *tx_data;
-static uint64_t *rx_tail;
-static uint64_t *rx_head;
-static uint64_t *rx_md;
-static void *rx_data;
+static volatile uint64_t *tx_tail;
+static volatile uint64_t *tx_head;
+static volatile void *tx_md;
+static volatile void *tx_data;
+static volatile uint64_t *rx_tail;
+static volatile uint64_t *rx_head;
+static volatile void *rx_md;
+static volatile void *rx_data;
+
+spinlock_t tx_lock;
+spinlock_t rx_lock;
+spinlock_t read_lock;
+spinlock_t write_lock;
 
 static struct net_device *vnic_dev;
 static struct task_struct *polling_thread;
@@ -114,40 +134,152 @@ static int vnic_close(struct net_device *dev);
 static netdev_tx_t vnic_start_xmit(struct sk_buff *skb, struct net_device *dev);
 static int vnic_poll_rx(void *data);
 
-static uint64_t vnic_read_share_mem(uint64_t *addr)
+#ifdef FPFA
+#else
+static int vnic_get_sharemem_offset(uint64_t *addr)
+{
+    uint64_t offset = (uint64_t)addr - (uint64_t)XDMA_BAR_BASE;
+    if (offset >= (1 << 28)) { // Check if the address is within the valid range
+        pr_err("Address 0x%llx is out of bounds\n", (unsigned long long)addr);
+        return -EINVAL;
+    }
+    return offset;
+}
+#endif
+
+static void vnic_flush_cache(void)
 {
     #ifdef FPGA
-        return *addr;
+        uint64_t cache_block_size = 64;
+        uint64_t cache_sets = 128;
+        uint64_t cache_size = 32768;
     #else
-        return vnic_xdma_read((uint64_t)addr);
+        uint64_t cache_block_size = 64;
+        uint64_t cache_sets = 64;
+        uint64_t cache_size = 49152;
     #endif
+    uint64_t cache_associativity = cache_size / (cache_block_size * cache_sets);
+    uint8_t *buffer = kmalloc(cache_size, GFP_KERNEL);
+    if (!buffer) {
+        pr_err("Failed to allocate memory for cache flush\n");
+        return;
+    }
+    volatile uint8_t *v_buffer = buffer;
+    int set, way;
+    volatile uint8_t *ptr;
+    for (set = 0; set < cache_sets; set++) {
+        for (way = 0; way < cache_associativity; way++) {
+            // 计算当前目标地址：基址 + 块偏移 + 组偏移 + 路偏移
+            ptr = v_buffer + (set * cache_block_size) + (way * cache_sets * cache_block_size);
+            *ptr = 1;
+        }
+    }
+}
+
+static uint64_t vnic_read_share_mem(uint64_t *addr)
+{
+    uint32_t flags;
+    spin_lock_irqsave(&read_lock, flags);
+    uint64_t val;
+    #ifdef FPGA
+    /*
+        uint32_t lo = ioread32((u8 __iomem *)addr);
+	    uint32_t hi = ioread32((u8 __iomem *)addr + 4);
+	    val = (((uint64_t)hi & 0xFFFFFFFFUL) << 32) | (lo & 0xFFFFFFFFUL);
+    */
+        vnic_flush_cache();
+        val = readq((void __iomem *)addr);
+        mb();
+    #else
+        int off = vnic_get_sharemem_offset(addr);
+        if (off < 0) {
+            return -EINVAL; // Invalid address
+        }
+        //VNIC_DBG("vnic_read_share_mem: off = 0x%lx, addr = 0x%llx\n", 
+        //    (unsigned long)off, (unsigned long long)addr);
+        vnic_flush_cache();
+        val = vnic_xdma_read((uint32_t)off);
+        mb();
+        if (val == (uint64_t)-1) {
+            pr_err("Failed to read from address 0x%llx\n", (unsigned long long)addr);
+            return -EIO; // Error in reading
+        }
+        //VNIC_DBG("vnic_read_share_mem: pa = 0x%llx, val = 0x%llx\n", 
+        //    (unsigned long long)addr, (unsigned long long)val);
+    #endif
+    //VNIC_DBG("vnic_read_share_mem: addr = 0x%llx, val = 0x%llx\n",
+    //    (unsigned long long)addr, (unsigned long long)val);
+    spin_unlock_irqrestore(&read_lock, flags);
+    return val;
 }
 
 static void vnic_write_share_mem(uint64_t *addr, uint64_t val)
 {
+    uint32_t flags;
+    spin_lock_irqsave(&write_lock, flags);
     #ifdef FPGA
-        *addr = val;
+    /*
+        uint32_t lo = (uint32_t)(val & 0xFFFFFFFFUL);
+	    uint32_t hi = (uint32_t)((val >> 32) & 0xFFFFFFFFUL);
+	    iowrite32(lo, (u8 __iomem *)addr);
+	    iowrite32(hi, (u8 __iomem *)addr + 4);
+    */
+        writeq(val, (void __iomem *)addr);
+        mb();
+        vnic_flush_cache();
     #else
-        vnic_xdma_write((uint64_t)addr, val);
+        int off = vnic_get_sharemem_offset(addr);
+        if (off < 0) {
+            return; // Invalid address
+        }
+        vnic_xdma_write((uint32_t)off, val);
+        mb();
+        vnic_flush_cache();
     #endif
+    //VNIC_DBG("vnic_write_share_mem: addr = 0x%llx, val = 0x%llx\n",
+    //    (unsigned long long)addr, (unsigned long long)val);
+    spin_unlock_irqrestore(&write_lock, flags);
+    return;
 }
 
-static void vnic_memcpy_to_share_mem(uint64_t addr, void *data, size_t len)
+static void vnic_memcpy_to_share_mem(void *addr, void *data, size_t len)
 {
+    uint32_t flags;
+    spin_lock_irqsave(&write_lock, flags);
     #ifdef FPGA
-        memcpy((void*)addr, data, len);
+        memcpy(addr, data, len);
+        mb();
+        vnic_flush_cache();
     #else
-        vnic_xdma_memcpy_to_share_mem(addr, data, len);
+        int off = vnic_get_sharemem_offset(addr);
+        if (off < 0) {
+            return;
+        }
+        vnic_xdma_memcpy_to_share_mem((uint32_t)off, data, len);
+        mb();
+        vnic_flush_cache();
     #endif
+    spin_unlock_irqrestore(&write_lock, flags);
 }
 
-static void vnic_memcpy_from_share_mem(uint64_t addr, void *data, size_t len)
+static void vnic_memcpy_from_share_mem(void *addr, void *data, size_t len)
 {
+    uint32_t flags;
+    spin_lock_irqsave(&read_lock, flags);
     #ifdef FPGA
-        memcpy(data, (void*)addr, len);
+        vnic_flush_cache();
+        memcpy(data, addr, len);
+        mb();
     #else
-        vnic_xdma_memcpy_from_share_mem(addr, data, len);
+        int off = vnic_get_sharemem_offset(addr);
+        if (off < 0) {
+            return;
+        }
+        vnic_flush_cache();
+        vnic_xdma_memcpy_from_share_mem((uint32_t)off, data, len);
+        mb();
     #endif
+    spin_unlock_irqrestore(&read_lock, flags);
 }
 
 static int vnic_init_share_mem(void)
@@ -169,104 +301,163 @@ static int vnic_init_share_mem(void)
         }
         phys_addr = res.start;
         size = resource_size(&res);
-
+        
         share_mem_virt = ioremap(phys_addr, size);
         if (!share_mem_virt) {
             pr_err("ioremap failed\n");
             return -ENOMEM;
         }
         memset(share_mem_virt, 0x0, size);
-        pr_info("Reserved memory mapped at virtual address: 0x%llx -> 0x%llx\n",
-                (uint64_t)phys_addr, share_mem_virt);
     #else
         share_mem_virt = (void *)SHARE_MEM_BASE;
-        pr_info("fpga reserved memory at fpga physical address: 0x%llx\n",
-                (uint64_t)share_mem_virt);
     #endif
 
     tx_tail = (uint64_t *)(share_mem_virt + TX_TAIL_OFFSET);
     tx_head = (uint64_t *)(share_mem_virt + TX_HEAD_OFFSET);
-    tx_md = (uint64_t *)(share_mem_virt + TX_MD_FIFO_OFFSET);
+    tx_md = (void *)(share_mem_virt + TX_MD_FIFO_OFFSET);
     tx_data = (void *)(share_mem_virt + TX_D_FIFO_OFFSET);
     rx_tail = (uint64_t *)(share_mem_virt + RX_TAIL_OFFSET);
     rx_head = (uint64_t *)(share_mem_virt + RX_HEAD_OFFSET);
-    rx_md = (uint64_t *)(share_mem_virt + RX_MD_FIFO_OFFSET);
+    rx_md = (void *)(share_mem_virt + RX_MD_FIFO_OFFSET);
     rx_data = (void *)(share_mem_virt + RX_D_FIFO_OFFSET);
+
+    VNIC_DBG("share mem base address: 0x%llx\n", (uint64_t)share_mem_virt);
+    VNIC_DBG("TX tail address: 0x%llx\n", (uint64_t)tx_tail);
+    VNIC_DBG("TX head address: 0x%llx\n", (uint64_t)tx_head);
+    VNIC_DBG("TX metadata FIFO address: 0x%llx\n", tx_md);
+    VNIC_DBG("TX data FIFO address: 0x%llx\n", (uint64_t)tx_data);
+    VNIC_DBG("RX tail address: 0x%llx\n", (uint64_t)rx_tail);
+    VNIC_DBG("RX head address: 0x%llx\n", (uint64_t)rx_head);
+    VNIC_DBG("RX metadata FIFO address: 0x%llx\n", rx_md);
+    VNIC_DBG("RX data FIFO address: 0x%llx\n", (uint64_t)rx_data);
 
     return 0;
 }
 
 static int vnic_tx_full(void)
 {
-    return (vnic_read_share_mem(tx_tail) + 1) % MAX_DESC == vnic_read_share_mem(tx_head);
+    uint64_t tail = vnic_read_share_mem(tx_tail);
+    uint64_t head = vnic_read_share_mem(tx_head);
+    //("vnic_tx_full: tx_tail = %llx, tx_head = %llx\n", tail, head);
+    return ((tail + 1) % MAX_DESC == head);
 }
 
 static int vnic_rx_empty(void)
 {
-    return vnic_read_share_mem(rx_tail) == vnic_read_share_mem(rx_head);
+    uint64_t tail = vnic_read_share_mem(rx_tail);
+    uint64_t head = vnic_read_share_mem(rx_head);
+    //VNIC_DBG("vnic_rx_empty: rx_tail = %llu, rx_head = %llu\n", tail, head);
+    return (tail == head);
 }
 
-static uint64_t *vnic_get_tx_buf_addr(bool is_metadata)
+static void *vnic_get_tx_buf_addr(bool is_metadata)
 {
     if (vnic_tx_full()) {
         pr_err("TX FIFO is full, cannot get metadata\n");
         return NULL;
     }
+    uint64_t txtail = vnic_read_share_mem(tx_tail);
     if (is_metadata) {
-        uint64_t *md_buf = tx_md + (vnic_read_share_mem(tx_tail) % MAX_DESC);
-        if (md_buf[2] == 1) {
+        //void *md_buf = tx_md + (vnic_read_share_mem(tx_tail) * DESC_SIZE);
+        void *md_buf = tx_md + txtail * DESC_SIZE;
+        VNIC_DBG("vnic_get_tx_buf_addr: md_buf = %llx, tx_tail = %llx cpu = %x\n", md_buf, vnic_read_share_mem(tx_tail), smp_processor_id());
+        if (vnic_read_share_mem(md_buf + 2 * 8) == 0x1ULL) {
             pr_err("Metadata buffer is already in use\n");
             return NULL; // Metadata buffer is already in use
         }
         return md_buf;
     } else {
-        uint64_t *data_buf = (uint64_t *)(tx_data + (vnic_read_share_mem(tx_tail) % MAX_DESC) * MAX_PACKET_SIZE);
+        void *data_buf = tx_data + txtail * MAX_PACKET_SIZE;
+        return data_buf;
+    }
+}
+
+static void *vnic_get_rx_buf_addr(bool is_metadata)
+{
+    if (vnic_rx_empty()) {
+        pr_err("RX FIFO is empty, no metadata to read\n");
+        return NULL;
+    }
+    uint64_t rxhead = vnic_read_share_mem(rx_head);
+    if (is_metadata) {
+        //void *md_buf = rx_md + (vnic_read_share_mem(rx_head) * DESC_SIZE);
+        void *md_buf = rx_md + rxhead * DESC_SIZE;
+        VNIC_DBG("vnic_get_rx_buf_addr: md_buf = %llx, rx_head = %llx, cpu = %x\n", md_buf, vnic_read_share_mem(rx_head), smp_processor_id());
+        if (vnic_read_share_mem(md_buf + 2 * 8) == 0x0ULL) {
+            pr_err("Metadata buffer is not in use\n");
+            return NULL;
+        }
+        return md_buf;
+    } else {
+        void *data_buf = rx_data + rxhead * MAX_PACKET_SIZE;
         return data_buf;
     }
 }
 
 static int vnic_send_packet(struct sk_buff *skb)
 {
-    pr_info("send packet: %p\n", skb);
-    
+    if (!vnic_opened)
+        return NETDEV_TX_OK; // Device is not opened
+
     if (vnic_tx_full()) {
         pr_err("TX FIFO is full, cannot send packet\n");
         return NETDEV_TX_BUSY; // No space in TX FIFO
     }
 
-    uint64_t *dst_buf = vnic_get_tx_buf_addr(false);
-    uint64_t *md_buf = vnic_get_tx_buf_addr(true);
-    if (!dst_buf || !md_buf) {
-        pr_err("Failed to get TX buffers\n");
-        return NETDEV_TX_BUSY; // No space in TX FIFO
+    void *dst_buf = vnic_get_tx_buf_addr(false);
+    void *md_buf = vnic_get_tx_buf_addr(true);
+    //VNIC_DBG("vnic_send_packet: dst_buf = %p, md_buf = %p sk_buf = %p\n", dst_buf, md_buf, skb->data);
+    if (!md_buf || !dst_buf) {
+        pr_err("0x%llx times Failed to get TX buffers\n", ++fail_count);
+        return -EIO; // Error in reading RX buffers
     }
-    vnic_memcpy_to_share_mem((uint64_t)dst_buf, skb->data, skb->len);
-    vnic_write_share_mem(md_buf, (uint64_t)dst_buf); // Set buffer address
-    vnic_write_share_mem(md_buf + 1, skb->len);      // Set length of the packet
-    vnic_write_share_mem(md_buf + 2, 1);             // Set valid flag
-    vnic_write_share_mem(md_buf + 3, 0);             // Reserved
-    vnic_write_share_mem(tx_tail, (vnic_read_share_mem(tx_tail) + 1) % MAX_DESC); // Update tail pointer
+    if(fail_count > 100) debug = false; // Disable debug after 10 failures
+    uint64_t i = 10000;
+    while (i--) {;}
+    uint64_t txtail = vnic_read_share_mem(tx_tail);
+    uint64_t txhead = vnic_read_share_mem(tx_head);
+    uint64_t next_txtail;
+    vnic_memcpy_to_share_mem(dst_buf, skb->data, skb->len);
+    //vnic_write_share_mem(md_buf, (uint64_t)dst_buf); // Set buffer address
+    //we do not need to set buf addr, rx can calculate it from tx_tail
+    vnic_write_share_mem(md_buf + 8, skb->len);      // Set length of the packet
+    vnic_write_share_mem(md_buf + 2 * 8, 0x1ULL);             // Set valid flag
+    //vnic_write_share_mem(md_buf + 3 * 8, 0UL);             // Reserved
+    vnic_write_share_mem(tx_tail, (txtail + 1) % MAX_DESC); // Update tail pointer
+    next_txtail = vnic_read_share_mem(tx_tail);
     vnic_dev->stats.tx_packets++;
     vnic_dev->stats.tx_bytes += skb->len;
+    //uint64_t txtail = vnic_read_share_mem(tx_tail);
+    uint64_t first_8B = vnic_read_share_mem((uint64_t*)dst_buf);
+    uint64_t len = vnic_read_share_mem(md_buf + 8); // Get length of the packet
+    VNIC_DBG("send packet: first 8B = 0x%llx, buf = 0x%llx, len = 0x%llx, md = 0x%llx, txtail = 0x%llx, txhead = 0x%llx, next txtail = 0x%llx\n", 
+        first_8B, dst_buf, len, md_buf, txtail, txhead, next_txtail);
     return NETDEV_TX_OK;
 }
 
 static int vnic_recv_packet(void)
 {
     if (vnic_rx_empty()) {
-        pr_info("RX FIFO is empty, no packet to receive\n");
+        //VNIC_DBG("RX FIFO is empty, no packet to receive\n");
         return 0; // No packet to receive
     }
-
-    uint64_t *md_buf = rx_md + (vnic_read_share_mem(rx_head) % MAX_DESC);
-    if (!md_buf) {
-        pr_err("Failed to get RX metadata buffer\n");
-        return -EIO; // Error in getting metadata buffer
+    uint64_t rxtail = vnic_read_share_mem(rx_tail);
+    uint64_t rxhead = vnic_read_share_mem(rx_head);
+    //uint64_t *md_buf = rx_md + (rxhead * (DESC_SIZE / sizeof(uint64_t)));
+    void *md_buf = vnic_get_rx_buf_addr(true);
+    void *data_buf = vnic_get_rx_buf_addr(false);
+    if (!md_buf || !data_buf) {
+        pr_err("0x%llx times Failed to get RX buffers\n", ++fail_count);
+        return -EIO; // Error in reading RX buffers
     }
+    if(fail_count > 100) debug = false; // Disable debug after 10 failures
+    void *buf = rx_data + rxhead * MAX_PACKET_SIZE; // Get buffer address
+    uint64_t first_8B = vnic_read_share_mem((uint64_t*)buf);
+    uint64_t len = vnic_read_share_mem((uint64_t*)(md_buf + 8)); // Get length of the packet
+    uint64_t next_rxhead;
 
-    BUG_ON(md_buf[2] != 1); // Ensure metadata is valid
-    uint64_t buf = md_buf[0]; // Get buffer address
-    uint64_t len = md_buf[1]; // Get length of the packet
+    vnic_dev->stats.rx_packets++;
+    vnic_dev->stats.rx_bytes += len;
 
     struct sk_buff *skb = netdev_alloc_skb(vnic_dev, len + NET_IP_ALIGN);
     if (!skb) {
@@ -282,10 +473,11 @@ static int vnic_recv_packet(void)
 
     netif_rx(skb);
 
-    vnic_write_share_mem(md_buf + 2, 0);
-    vnic_write_share_mem(rx_head, (vnic_read_share_mem(rx_head) + 1) % MAX_DESC);
-    vnic_dev->stats.rx_packets++;
-    vnic_dev->stats.rx_bytes += len;
+    vnic_write_share_mem(md_buf + 2 * 8, 0x0ULL);
+    vnic_write_share_mem(rx_head, (rxhead + 1) % MAX_DESC);
+    next_rxhead = vnic_read_share_mem(rx_head);
+    VNIC_DBG("recv packet: first 8B = 0x%llx, buf = 0x%llx, len = 0x%llx, md = 0x%llx, rxtail = 0x%llx, rxhead = 0x%llx, next_rxhead = 0x%llx\n",
+        first_8B, buf, len, md_buf, rxtail, rxhead, next_rxhead);
 
     return len;
 }

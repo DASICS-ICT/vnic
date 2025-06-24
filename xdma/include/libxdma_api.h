@@ -147,6 +147,9 @@ ssize_t xdma_xfer_completion(void *cb_hndl, void *dev_hndl, int channel, bool wr
  */
 void *xdma_get_dev_hndl(void);
 
+uint64_t xdma_read64_bar(uint32_t off);
+void xdma_write64_bar(uint32_t off, uint64_t val);
+
 /////////////////////missing API////////////////////
 
 //xdma_get_channle_state - if no interrupt on DMA hang is available

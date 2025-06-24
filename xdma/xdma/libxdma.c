@@ -3462,8 +3462,8 @@ unmap_sgl:
 ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 			 struct sg_table *sgt, bool dma_mapped, int timeout_ms)
 {
-	pr_info("xdma_xfer_submit dev_hndl %p, channel %d, write %d, ep_addr 0x%llx, dma_mapped %d, timeout_ms %d.\n",
-		dev_hndl, channel, write, ep_addr, dma_mapped, timeout_ms);
+	//pr_info("xdma_xfer_submit dev_hndl %p, channel %d, write %d, ep_addr 0x%llx, dma_mapped %d, timeout_ms %d.\n",
+	//	dev_hndl, channel, write, ep_addr, dma_mapped, timeout_ms);
 	//pr_info("\n", sgt->);
 	struct xdma_dev *xdev = (struct xdma_dev *)dev_hndl;
 	struct xdma_engine *engine;
@@ -3997,6 +3997,7 @@ rel_req:
 
 	return rv;
 }
+EXPORT_SYMBOL(xdma_xfer_submit_nowait);
 
 int xdma_performance_submit(struct xdma_dev *xdev, struct xdma_engine *engine)
 {

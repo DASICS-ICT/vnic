@@ -362,6 +362,37 @@ void *xdma_get_dev_hndl(void)
 }
 EXPORT_SYMBOL(xdma_get_dev_hndl);
 
+uint64_t xdma_read64_bar(uint32_t off)
+{
+	struct xdma_dev *xdev = xdma_get_dev_hndl();
+	if (!xdev) {
+		pr_err("xdma_get_dev_hndl returned NULL\n");
+		return -ENODEV; // Device not found
+	}
+	void __iomem *target = (u8 __iomem *)xdev->bar[2] + off;
+	uint32_t lo = ioread32(target);
+	uint32_t hi = ioread32(target + 4);
+	uint64_t val = (((uint64_t)hi & 0xFFFFFFFFUL) << 32) | (lo & 0xFFFFFFFFUL);
+	//pr_info("xdma_read64_bar: off = 0x%lx, read value = 0x%llx\n", off, val);
+	return val;
+}
+EXPORT_SYMBOL(xdma_read64_bar);
+
+void xdma_write64_bar(uint32_t off, uint64_t val)
+{
+	struct xdma_dev *xdev = xdma_get_dev_hndl();
+	if (!xdev) {
+		pr_err("xdma_get_dev_hndl returned NULL\n");
+		return; // Device not found
+	}
+	void __iomem *target = (u8 __iomem *)xdev->bar[2] + off;
+	//pr_info("xdma_write64_bar: off = 0x%llx, write value = 0x%llx\n", off, val);
+	uint32_t lo = (uint32_t)(val & 0xFFFFFFFFUL);
+	uint32_t hi = (uint32_t)((val >> 32) & 0xFFFFFFFFUL);
+	iowrite32(lo, target);
+	iowrite32(hi, target + 4);
+}
+EXPORT_SYMBOL(xdma_write64_bar);
 
 static int xdma_mod_init(void)
 {
