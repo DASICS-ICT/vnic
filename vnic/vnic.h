@@ -11,6 +11,7 @@
 #include <asm/page.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
+#include <linux/ip.h>
 
 #define DRV_NAME "vnic"
 
@@ -108,6 +109,16 @@ static struct metadata {
 #define DESC_SIZE 0x40ULL
 #define MAX_PACKET_SIZE 0x1000ULL
 
+#define X86_MAC "\x11\x22\x33\x44\x55\x66"
+#define RV_MAC "\x01\x02\x03\x04\x05\x06"
+#ifdef FPGA
+    #define SRC_MAC RV_MAC
+    #define DST_MAC X86_MAC
+#else
+    #define SRC_MAC X86_MAC
+    #define DST_MAC RV_MAC
+#endif
+
 static bool vnic_opened = false;
 
 static void __iomem *share_mem_virt;
@@ -150,6 +161,7 @@ static int vnic_get_sharemem_offset(uint64_t *addr)
 static void vnic_flush_cache(void)
 {
     #ifdef FPGA
+        return;
         uint64_t cache_block_size = 64;
         uint64_t cache_sets = 128;
         uint64_t cache_size = 32768;
@@ -159,7 +171,7 @@ static void vnic_flush_cache(void)
         uint64_t cache_size = 49152;
     #endif
     uint64_t cache_associativity = cache_size / (cache_block_size * cache_sets);
-    uint8_t *buffer = kmalloc(cache_size, GFP_KERNEL);
+    uint8_t *buffer = kmalloc(2 * cache_size, GFP_KERNEL);
     if (!buffer) {
         pr_err("Failed to allocate memory for cache flush\n");
         return;
@@ -174,6 +186,7 @@ static void vnic_flush_cache(void)
             *ptr = 1;
         }
     }
+    kfree(buffer);
 }
 
 static uint64_t vnic_read_share_mem(uint64_t *addr)
@@ -393,6 +406,16 @@ static void *vnic_get_rx_buf_addr(bool is_metadata)
     }
 }
 
+static void vnic_dump_64B(void *addr)
+{
+    uint64_t *data = (uint64_t *)addr;
+    int i;
+    VNIC_DBG("Dumping 64B at address %llx:\n", (unsigned long long)addr);
+    for (i = 0; i < 8; i++) {
+        VNIC_DBG("0x%016llx %s", vnic_read_share_mem(data + i), (i == 7) ? "\n" : " ");
+    }
+}
+
 static int vnic_send_packet(struct sk_buff *skb)
 {
     if (!vnic_opened)
@@ -414,6 +437,8 @@ static int vnic_send_packet(struct sk_buff *skb)
     uint64_t txtail = vnic_read_share_mem(tx_tail);
     uint64_t txhead = vnic_read_share_mem(tx_head);
     uint64_t next_txtail;
+    memcpy(eth_hdr(skb)->h_source, SRC_MAC, ETH_ALEN);
+    memcpy(eth_hdr(skb)->h_dest, DST_MAC, ETH_ALEN); 
     vnic_memcpy_to_share_mem(dst_buf, skb->data, skb->len);
     //vnic_write_share_mem(md_buf, (uint64_t)dst_buf); // Set buffer address
     //we do not need to set buf addr, rx can calculate it from tx_tail
@@ -425,10 +450,14 @@ static int vnic_send_packet(struct sk_buff *skb)
     vnic_dev->stats.tx_packets++;
     vnic_dev->stats.tx_bytes += skb->len;
     //uint64_t txtail = vnic_read_share_mem(tx_tail);
-    uint64_t first_8B = vnic_read_share_mem((uint64_t*)dst_buf);
+    //uint64_t first_8B = vnic_read_share_mem((uint64_t*)dst_buf);
     uint64_t len = vnic_read_share_mem(md_buf + 8); // Get length of the packet
-    VNIC_DBG("send packet: first 8B = 0x%llx, buf = 0x%llx, len = 0x%llx, md = 0x%llx, txtail = 0x%llx, txhead = 0x%llx, next txtail = 0x%llx\n", 
-        first_8B, dst_buf, len, md_buf, txtail, txhead, next_txtail);
+    VNIC_DBG("send packet: buf = 0x%llx, len = 0x%llx, md = 0x%llx, txtail = 0x%llx, txhead = 0x%llx, next txtail = 0x%llx\n", 
+        dst_buf, len, md_buf, txtail, txhead, next_txtail);
+    VNIC_DBG("send packet: src mac = %pM dst mac = %pM\n",
+        eth_hdr(skb)->h_source, eth_hdr(skb)->h_dest);
+    vnic_dump_64B(dst_buf);
+    dev_kfree_skb(skb); // Free the skb after processing
     return NETDEV_TX_OK;
 }
 
@@ -449,7 +478,7 @@ static int vnic_recv_packet(void)
     }
     if(fail_count > 100) debug = false; // Disable debug after 10 failures
     void *buf = rx_data + rxhead * MAX_PACKET_SIZE; // Get buffer address
-    uint64_t first_8B = vnic_read_share_mem((uint64_t*)buf);
+    //uint64_t first_8B = vnic_read_share_mem((uint64_t*)buf);
     uint64_t len = vnic_read_share_mem((uint64_t*)(md_buf + 8)); // Get length of the packet
     uint64_t next_rxhead;
 
@@ -463,19 +492,23 @@ static int vnic_recv_packet(void)
     }
     skb_reserve(skb, NET_IP_ALIGN); // Align the skb data
     skb_put(skb, len); // Set the length of the skb
+    vnic_memcpy_from_share_mem(buf, skb->data, len);
     skb->protocol = eth_type_trans(skb, vnic_dev);
     skb->dev = vnic_dev;
+    skb->pkt_type = PACKET_HOST; 
     skb->tstamp = ktime_get_real();
-    vnic_memcpy_from_share_mem(buf, skb->data, len);
 
     netif_rx(skb);
 
     vnic_write_share_mem(md_buf + 2 * 8, 0x0ULL);
     vnic_write_share_mem(rx_head, (rxhead + 1) % MAX_DESC);
     next_rxhead = vnic_read_share_mem(rx_head);
-    VNIC_DBG("recv packet: first 8B = 0x%llx, buf = 0x%llx, len = 0x%llx, md = 0x%llx, rxtail = 0x%llx, rxhead = 0x%llx, next_rxhead = 0x%llx\n",
-        first_8B, buf, len, md_buf, rxtail, rxhead, next_rxhead);
-
+    VNIC_DBG("recv packet: buf = 0x%llx, len = 0x%llx, md = 0x%llx, rxtail = 0x%llx, rxhead = 0x%llx, next_rxhead = 0x%llx\n",
+        buf, len, md_buf, rxtail, rxhead, next_rxhead);
+    VNIC_DBG("recv packet: src mac = %pM dst mac = %pM\n",
+        eth_hdr(skb)->h_source, eth_hdr(skb)->h_dest);
+    vnic_dump_64B(buf);
+    //dev_kfree_skb(skb); // Free the skb after processing
     return len;
 }
 

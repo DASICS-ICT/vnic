@@ -91,15 +91,15 @@ static void vnic_setup(struct net_device *dev)
     dev->real_num_tx_queues = 1;
     
     /* random mac */
-    eth_random_addr(dev->dev_addr);
+    //eth_random_addr(dev->dev_addr);
     /* manually set mac address */
-    /*
+    
     #ifdef FPGA
-        memcpy(dev->dev_addr, "\x01\x02\x03\x04\x05\x06", ETH_ALEN);
+        memcpy(dev->dev_addr, RV_MAC, ETH_ALEN);
     #else
-        memcpy(dev->dev_addr, "\x11\x22\x33\x44\x55\x66", ETH_ALEN);
+        memcpy(dev->dev_addr, X86_MAC, ETH_ALEN);
     #endif
-    */
+    
     if (vnic_init_share_mem()) {
         pr_err("Failed to initialize shared memory\n");
         return;
