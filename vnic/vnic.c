@@ -128,7 +128,7 @@ static int __init vnic_init(void)
         pr_err("Failed to start polling thread\n");
         return PTR_ERR(polling_thread);
     }
-    kthread_bind(polling_thread, 0); // Bind to CPU 0
+    //kthread_bind(polling_thread, 0); // Bind to CPU 0
     pr_info("Virtual network device %s registered\n", vnic_dev->name);
     return 0;
 }

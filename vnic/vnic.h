@@ -38,25 +38,25 @@ bool debug = true;
     +---------------------------+ base (0xf8000000)
     |         fpga tx tail        |
     |           64-bit            |
-    +---------------------------+ base + 8B (0xf8000008)
+    +---------------------------+ base + 8B (0xf8000400)
     |         fpga tx head        |
     |           64-bit            |
-    +---------------------------+ base + 16B (0xf8000010)
+    +---------------------------+ base + 16B (0xf8000800)
     |     fpga tx metadata fifo   |
-    |          32B * 1024         |
-    +---------------------------+ base + 16KB (0xf8004000)
+    |          64B * 1024         |
+    +---------------------------+ base + 16KB (0xf8020000)
     |       fpga tx data fifo     |
     |          4KB * 1024         |
     +---------------------------+ base + 64MB (0xfc000000)
     |         host tx tail        |
     |           64-bit            |
-    +---------------------------+ base + 64MB + 8B (0xfc000008)
+    +---------------------------+ base + 64MB + 8B (0xfc000400)
     |         host tx head        |
     |           64-bit            |
-    +---------------------------+ base + 64MB + 16B (0xfc000010)
+    +---------------------------+ base + 64MB + 16B (0xfc000800)
     |       host tx metadata fifo |
-    |          32B * 1024         |
-    +---------------------------+ base + 64MB + 16KB (0xfc004000)
+    |          64B * 1024         |
+    +---------------------------+ base + 64MB + 16KB (0xfc020000)
     |       host tx data fifo     |
     |          4KB * 1024         |
     +---------------------------+ base + 128MB (0x100000000)
@@ -71,14 +71,14 @@ static struct metadata {
 } metadata;
 */
 
-#define FPGA_TX_TAIL_OFFSET 0x0
-#define FPGA_TX_HEAD_OFFSET 0x8
-#define FPGA_TX_MD_FIFO_OFFSET 0x10
-#define FPGA_TX_D_FIFO_OFFSET (1 << 14) // 16KB
-#define HOST_TX_TAIL_OFFSET (1 << 26) // 64MB
-#define HOST_TX_HEAD_OFFSET (1 << 26) + 0x8
-#define HOST_TX_MD_FIFO_OFFSET (1 << 26) + 0x10
-#define HOST_TX_D_FIFO_OFFSET (1 << 26) + (1 << 14) // 64MB + 16KB
+#define FPGA_TX_TAIL_OFFSET 0x0ULL
+#define FPGA_TX_HEAD_OFFSET 0x400ULL
+#define FPGA_TX_MD_FIFO_OFFSET 0x800ULL
+#define FPGA_TX_D_FIFO_OFFSET 0x20000ULL
+#define HOST_TX_TAIL_OFFSET 0x4000000ULL
+#define HOST_TX_HEAD_OFFSET (HOST_TX_TAIL_OFFSET + FPGA_TX_HEAD_OFFSET)
+#define HOST_TX_MD_FIFO_OFFSET (HOST_TX_TAIL_OFFSET + FPGA_TX_MD_FIFO_OFFSET)
+#define HOST_TX_D_FIFO_OFFSET (HOST_TX_TAIL_OFFSET + FPGA_TX_D_FIFO_OFFSET)
 
 #define XDMA_BAR_BASE 0x50000000UL
 
@@ -104,9 +104,9 @@ static struct metadata {
     #define RX_D_FIFO_OFFSET FPGA_TX_D_FIFO_OFFSET
 #endif
 
-#define MAX_DESC 0x400UL
-#define DESC_SIZE 0x20UL // 4 * 8B for metadata
-#define MAX_PACKET_SIZE 0x1000UL
+#define MAX_DESC 0x400ULL
+#define DESC_SIZE 0x40ULL
+#define MAX_PACKET_SIZE 0x1000ULL
 
 static bool vnic_opened = false;
 
@@ -202,7 +202,6 @@ static uint64_t vnic_read_share_mem(uint64_t *addr)
         mb();
         if (val == (uint64_t)-1) {
             pr_err("Failed to read from address 0x%llx\n", (unsigned long long)addr);
-            return -EIO; // Error in reading
         }
         //VNIC_DBG("vnic_read_share_mem: pa = 0x%llx, val = 0x%llx\n", 
         //    (unsigned long long)addr, (unsigned long long)val);
@@ -301,7 +300,7 @@ static int vnic_init_share_mem(void)
         }
         phys_addr = res.start;
         size = resource_size(&res);
-        
+
         share_mem_virt = ioremap(phys_addr, size);
         if (!share_mem_virt) {
             pr_err("ioremap failed\n");
@@ -360,7 +359,7 @@ static void *vnic_get_tx_buf_addr(bool is_metadata)
     if (is_metadata) {
         //void *md_buf = tx_md + (vnic_read_share_mem(tx_tail) * DESC_SIZE);
         void *md_buf = tx_md + txtail * DESC_SIZE;
-        VNIC_DBG("vnic_get_tx_buf_addr: md_buf = %llx, tx_tail = %llx cpu = %x\n", md_buf, vnic_read_share_mem(tx_tail), smp_processor_id());
+        VNIC_DBG("vnic_get_tx_buf_addr: md_buf = %llx, tx_tail = %llx cpu = %x\n", md_buf, txtail, smp_processor_id());
         if (vnic_read_share_mem(md_buf + 2 * 8) == 0x1ULL) {
             pr_err("Metadata buffer is already in use\n");
             return NULL; // Metadata buffer is already in use
@@ -412,8 +411,6 @@ static int vnic_send_packet(struct sk_buff *skb)
         return -EIO; // Error in reading RX buffers
     }
     if(fail_count > 100) debug = false; // Disable debug after 10 failures
-    uint64_t i = 10000;
-    while (i--) {;}
     uint64_t txtail = vnic_read_share_mem(tx_tail);
     uint64_t txhead = vnic_read_share_mem(tx_head);
     uint64_t next_txtail;
