@@ -17,7 +17,7 @@
 
 uint64_t fail_count = 0;
 
-bool debug = true;
+bool debug = 0;
 
 #define VNIC_DBG(fmt, ...) \
     do { \
@@ -119,6 +119,22 @@ static struct metadata {
     #define DST_MAC RV_MAC
 #endif
 
+#ifdef FPGA
+    #define vnic_lock_irqsave(lock, flags) \
+        do { /* FPGA模式无操作 */ } while (0)
+#else
+    #define vnic_lock_irqsave(lock, flags) \
+        do { spin_lock_irqsave(lock, flags); } while (0)
+#endif
+
+#ifdef FPGA
+    #define vnic_unlock_irqrestore(lock, flags) \
+        do { /* FPGA模式无操作 */ } while (0)
+#else
+    #define vnic_unlock_irqrestore(lock, flags) \
+        do { spin_unlock_irqrestore(lock, flags); } while (0)
+#endif
+
 static bool vnic_opened = false;
 
 static void __iomem *share_mem_virt;
@@ -192,7 +208,7 @@ static void vnic_flush_cache(void)
 static uint64_t vnic_read_share_mem(uint64_t *addr)
 {
     uint32_t flags;
-    spin_lock_irqsave(&read_lock, flags);
+    vnic_lock_irqsave(&read_lock, flags);
     uint64_t val;
     #ifdef FPGA
     /*
@@ -221,14 +237,14 @@ static uint64_t vnic_read_share_mem(uint64_t *addr)
     #endif
     //VNIC_DBG("vnic_read_share_mem: addr = 0x%llx, val = 0x%llx\n",
     //    (unsigned long long)addr, (unsigned long long)val);
-    spin_unlock_irqrestore(&read_lock, flags);
+    vnic_unlock_irqrestore(&read_lock, flags);
     return val;
 }
 
 static void vnic_write_share_mem(uint64_t *addr, uint64_t val)
 {
     uint32_t flags;
-    spin_lock_irqsave(&write_lock, flags);
+    vnic_lock_irqsave(&write_lock, flags);
     #ifdef FPGA
     /*
         uint32_t lo = (uint32_t)(val & 0xFFFFFFFFUL);
@@ -250,14 +266,14 @@ static void vnic_write_share_mem(uint64_t *addr, uint64_t val)
     #endif
     //VNIC_DBG("vnic_write_share_mem: addr = 0x%llx, val = 0x%llx\n",
     //    (unsigned long long)addr, (unsigned long long)val);
-    spin_unlock_irqrestore(&write_lock, flags);
+    vnic_unlock_irqrestore(&write_lock, flags);
     return;
 }
 
 static void vnic_memcpy_to_share_mem(void *addr, void *data, size_t len)
 {
     uint32_t flags;
-    spin_lock_irqsave(&write_lock, flags);
+    vnic_lock_irqsave(&write_lock, flags);
     #ifdef FPGA
         memcpy(addr, data, len);
         mb();
@@ -271,13 +287,13 @@ static void vnic_memcpy_to_share_mem(void *addr, void *data, size_t len)
         mb();
         vnic_flush_cache();
     #endif
-    spin_unlock_irqrestore(&write_lock, flags);
+    vnic_unlock_irqrestore(&write_lock, flags);
 }
 
 static void vnic_memcpy_from_share_mem(void *addr, void *data, size_t len)
 {
     uint32_t flags;
-    spin_lock_irqsave(&read_lock, flags);
+    vnic_lock_irqsave(&read_lock, flags);
     #ifdef FPGA
         vnic_flush_cache();
         memcpy(data, addr, len);
@@ -291,7 +307,7 @@ static void vnic_memcpy_from_share_mem(void *addr, void *data, size_t len)
         vnic_xdma_memcpy_from_share_mem((uint32_t)off, data, len);
         mb();
     #endif
-    spin_unlock_irqrestore(&read_lock, flags);
+    vnic_unlock_irqrestore(&read_lock, flags);
 }
 
 static int vnic_init_share_mem(void)

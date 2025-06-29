@@ -4,7 +4,7 @@
 static netdev_tx_t vnic_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
     uint32_t flags;
-    spin_lock_irqsave(&tx_lock, flags);
+    vnic_lock_irqsave(&tx_lock, flags);
     skb_tx_timestamp(skb);
     
     if (skb_is_nonlinear(skb)) {
@@ -20,7 +20,7 @@ static netdev_tx_t vnic_start_xmit(struct sk_buff *skb, struct net_device *dev)
     //if (skb)
     //    dev_kfree_skb(skb);
     int ret = vnic_send_packet(skb);
-    spin_unlock_irqrestore(&tx_lock, flags);
+    vnic_unlock_irqrestore(&tx_lock, flags);
     return ret;
 }
 
@@ -31,11 +31,7 @@ static int vnic_poll_rx(void *data)
         //pr_info("vnic poll one time\n");
         if (!vnic_opened) {
             //pr_info("vnic is not opened, skipping poll\n");
-            #ifdef FPGA
-                msleep(100);
-            #else
-                msleep(1000); // 如果设备未打开，休眠5毫秒降低CPU占用
-            #endif
+            msleep(1); // 如果设备未打开，休眠1毫秒降低CPU占用
             continue; // 跳过本次循环
         }
         uint32_t flags;
@@ -46,11 +42,7 @@ static int vnic_poll_rx(void *data)
             pr_err("Failed to receive packet: %d\n", ret);
             return -EIO; // 如果接收失败，继续下一次循环
         }
-        #ifdef FPGA
-            msleep(100);
-        #else
-            msleep(1000); // 如果设备未打开，休眠5毫秒降低CPU占用
-        #endif
+        msleep(1);  
     }
     return 0;
 }
