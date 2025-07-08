@@ -42,7 +42,9 @@ static int vnic_poll_rx(void *data)
             pr_err("Failed to receive packet: %d\n", ret);
             return -EIO; // 如果接收失败，继续下一次循环
         }
-        msleep(1);  
+        #ifdef FPGA
+            msleep(1);  
+        #endif
     }
     return 0;
 }
