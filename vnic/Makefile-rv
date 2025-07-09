@@ -1,7 +1,8 @@
 NAME = vnic
 obj-m += $(NAME).o
 TARGET := $(NAME).ko
-KERNEL_SRC ?= /home/lgf/dasics/riscv-linux
+WORK_DIR := $(HOME)/dasics
+KERNEL_SRC ?= $(WORK_DIR)/riscv-linux
 PWD := $(shell pwd)
 ARCH ?= riscv
 CROSS_COMPILE ?= riscv64-unknown-linux-gnu-
