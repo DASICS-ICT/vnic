@@ -69,7 +69,7 @@ uint64_t vnic_tx_burst(struct vnic_rxtx_desc_queue *txq, uint64_t nb_pkts, uint6
 	uint64_t nb_tx = 0;
 	uint64_t next_tail;
 	uint64_t last_head;
-	struct rte_mbuf *mbuf;
+	//struct rte_mbuf *mbuf;
 	struct vnic_rxtx_desc *tx_desc;
 
 	last_head = txq->last_head;
@@ -134,6 +134,79 @@ uint64_t vnic_process_tx_completion(struct vnic_rxtx_desc_queue *txq)
 	// 7. 更新本地头指针
 	txq->last_head = last_head;
 	return nb_tx_cmpl;
+}
+
+uint64_t vnic_rx_burst(struct vnic_rxtx_desc_queue *rxq, uint64_t nb_pkts, uint64_t pkt_size) 
+{
+	int i;
+	uint64_t nb_rx = 0;
+	uint64_t next_tail;
+	uint64_t last_head;
+	//struct rte_mbuf *mbuf;
+	struct vnic_rxtx_desc *rx_desc;
+
+	last_head = rxq->last_head;
+
+	for (i = 0; i < nb_pkts; i++) {
+		// 2. 检查队列空间是否足够
+		next_tail = (rxq->tail + 1) % VNIC_MAX_QUEUE_DEPTH;
+		if (next_tail == last_head) {
+			printf("RX queue full, stopping at %d packets\n", i);
+			return i;
+		}
+
+		// 3. 准备发送描述符
+		rx_desc = (struct vnic_rxtx_desc *)(vnic_rx_desc_base + rxq->tail * VNIC_DESC_SIZE);
+		rx_desc->buf = (uint64_t)(VNIC_RESV_MEM_PHYS + VNIC_RESV_RX_DATA + rxq->tail * VNIC_DATA_SIZE); // 获取DMA地址
+		rx_desc->len = pkt_size;          // 实际数据包长度
+		rx_desc->status = VNIC_DESC_STATUS_VALID; // 标记有效
+		rx_desc->id = rxq->tail;
+		rxq->tail = next_tail;
+		nb_rx++;
+		VNIC_DEBUG("submit rx req %llx buf=0x%llx len=%lu id=%lu status=0x%x\n",
+		      VNIC_RESV_MEM_PHYS + VNIC_RESV_RX_DESC + next_tail * VNIC_DESC_SIZE, rx_desc->buf, rx_desc->len, rx_desc->id, rx_desc->status);
+
+	}
+    
+    // 6. 通知FPGA有新的数据包
+    rte_wmb();
+    if (nb_rx > 0) {
+        vnic_write_reg64(VNIC_REG_RX_TAIL, rxq->tail); // 更新FPGA尾指针寄存器
+    }
+
+    return nb_rx;
+}
+
+uint64_t vnic_process_rx_completion(struct vnic_rxtx_desc_queue *rxq) 
+{
+	// 1. 读取FPGA更新后的头指针
+	uint64_t new_head = vnic_read_reg64(VNIC_REG_RX_HEAD);
+	uint64_t last_head = rxq->last_head;
+	struct vnic_rxtx_desc *rx_desc;
+	uint64_t nb_rx_cmpl = 0;
+
+	// 2. 处理所有已完成的数据包
+	while (last_head != new_head) {
+		//VNIC_DEBUG("last head: %d, new head: %lu\n", last_head, new_head);
+		rx_desc = (volatile struct vnic_rxtx_desc *)(vnic_rx_desc_base + last_head * VNIC_DESC_SIZE);
+
+		// 3. 检查完成状态
+		//printf("tx status: %x\n", tx_desc->status);
+		//if (tx_desc->status & VNIC_DESC_STATUS_DONE) {
+			// 5. 重置描述符状态
+			rx_desc->status = 0;
+			// 6. 移动到下一个描述符
+			last_head = (last_head + 1) % VNIC_MAX_QUEUE_DEPTH;
+			nb_rx_cmpl++;
+			//printf("cmpl tx req buf=0x%llx len=%lu id=%lu status=0x%x\n",
+			//	tx_desc->buf, tx_desc->len, tx_desc->id, tx_desc->status);
+
+		//}
+	}
+
+	// 7. 更新本地头指针
+	rxq->last_head = last_head;
+	return nb_rx_cmpl;
 }
 
 #endif /* VNIC_RXTX_H */

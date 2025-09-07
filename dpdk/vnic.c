@@ -39,7 +39,7 @@ int main(int argc, char *argv[])
 	int i;
 	struct rte_mempool *mbuf_pool;
 	struct vnic_rxtx_queue *rxq, *txq;
-	uint64_t nb_tx = 0, nb_tx_cmpl = 0;
+	uint64_t nb = 0, nb_cmpl = 0;
 
 	ret = rte_eal_init(argc, argv);
 	if (ret < 0) {
@@ -74,20 +74,31 @@ int main(int argc, char *argv[])
 	memset(stats, 0, sizeof(struct perf_stats));
 	stats->start_tsc = rte_rdtsc();
 
-	// RX/TX main loop
-	nb_tx = vnic_tx_burst(txq, burst_size, pkt_size);
-	VNIC_DEBUG("submit %lu packets for tx\n", nb_tx);
-	do { 
-		//VNIC_DEBUG("nb_tx = %lu, nb_tx_cmpl = %lu\n", nb_tx, nb_tx_cmpl);
-		nb_tx_cmpl += vnic_process_tx_completion(txq);
-	} while (nb_tx_cmpl != nb_tx);
+	// RX main
+	nb = vnic_rx_burst(rxq, burst_size, pkt_size);
+	VNIC_DEBUG("prepare to recv %lx packets for rx\n", nb);
+	do {
+		//VNIC_DEBUG("nb = %lu, nb_cmpl = %lu\n", nb, nb_cmpl);
+		nb_cmpl += vnic_process_rx_completion(rxq);
+	} while (nb_cmpl != nb);
+	//printf("cmpl %lu packets for rx\n", nb_cmpl);
+
+	// TX main
+	/*
+	nb = vnic_tx_burst(txq, burst_size, pkt_size);
+	VNIC_DEBUG("submit %lx packets for tx\n", nb);
+	do {
+		//VNIC_DEBUG("nb = %lu, nb_cmpl = %lu\n", nb, nb_cmpl);
+		nb_cmpl += vnic_process_tx_completion(txq);
+	} while (nb_cmpl != nb);
+	*/
 	stats->end_tsc = rte_rdtsc();
-	stats->total_packets = nb_tx_cmpl;
-	stats->total_bytes = nb_tx_cmpl * pkt_size;
+	stats->total_packets = nb_cmpl;
+	stats->total_bytes = nb_cmpl * pkt_size;
 	stats->duration_sec = (double)(stats->end_tsc - stats->start_tsc) / rte_get_tsc_hz();
 	stats->bandwidth_mbps = (double)(stats->total_bytes * 8) / (stats->duration_sec * 1e6);
 	stats->packets_per_sec = (double)stats->total_packets / stats->duration_sec;
-	printf("cmpl %lu packets for tx\n", nb_tx_cmpl);
+	//printf("cmpl %lu packets for tx\n", nb_cmpl);
 	printf("\n===== Performance Statistics =====\n");
 	printf("Total packets: %" PRIu64 "\n", stats->total_packets);
 	printf("Total bytes: %" PRIu64 " bytes\n", stats->total_bytes);

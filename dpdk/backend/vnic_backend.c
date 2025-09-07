@@ -45,6 +45,9 @@
 			printf(fmt, ##args); \
 	} while (0)
 
+int xdma_c2h_fd = 0;
+int xdma_h2c_fd = 0;
+
 static volatile void *vnic_regs_virt;
 static volatile void *vnic_resv_mem_virt;
 static volatile uint64_t *vnic_rx_desc_base;
@@ -107,7 +110,7 @@ static void vnic_dump_regs(void)
 	printf("VNIC STATUS: 0x%lx\n", vnic_read_reg64(VNIC_REG_STATUS));
 }
 
-void process_packet(uint64_t buf_addr, uint64_t len) {
+void tx_process_packet(uint64_t buf_addr, uint64_t len) {
 	// 计算缓冲区在映射内存中的位置
 	void *packet = malloc(len);
 	void *buf_addr_virt = vnic_resv_mem_virt + (buf_addr - FPGA_RESV_MEM_PHYS);
@@ -116,9 +119,35 @@ void process_packet(uint64_t buf_addr, uint64_t len) {
 		return;
 	}
 
-	VNIC_DEBUG("Processing packet @ 0x%lx, size: %lu bytes\n", buf_addr, len);
+	VNIC_DEBUG("Processing tx packet @ 0x%lx, size: %lu bytes\n", buf_addr, len);
 
-	memcpy(packet, buf_addr_virt, len);
+	//memcpy(packet, buf_addr_virt, len);
+	pread(xdma_c2h_fd, packet, len, buf_addr);
+
+	// 打印数据包内容（前64字节）
+	/*
+	VNIC_DEBUG("Packet data (first 64 bytes):\n");
+	for (int i = 0; i < 64 && i < len; i++) {
+		VNIC_DEBUG("%02x ", ((uint8_t *)packet)[i]);
+		if ((i + 1) % 16 == 0) VNIC_DEBUG("\n");
+	}
+	*/
+	free(packet);
+}
+
+void rx_process_packet(uint64_t buf_addr, uint64_t len) {
+	// 计算缓冲区在映射内存中的位置
+	void *packet = malloc(len);
+	void *buf_addr_virt = vnic_resv_mem_virt + (buf_addr - FPGA_RESV_MEM_PHYS);
+	if (!packet) {
+		printf("Failed to allocate memory for packet");
+		return;
+	}
+
+	VNIC_DEBUG("Processing rx packet @ 0x%lx, size: %lu bytes\n", buf_addr, len);
+
+	//memcpy(packet, buf_addr_virt, len);
+	pwrite(xdma_h2c_fd, packet, len, buf_addr);
 
 	// 打印数据包内容（前64字节）
 	/*
@@ -132,12 +161,13 @@ void process_packet(uint64_t buf_addr, uint64_t len) {
 }
 
 /* TX队列处理线程 */
-void tx_process(void) {
+void tx_handler(void) {
 	void *tx_desc_base = vnic_resv_mem_virt + VNIC_RESV_TX_DESC;
 	uint64_t last_head = vnic_read_reg64(VNIC_REG_TX_HEAD);
 	//sleep(1);
 	uint64_t tx_tail = vnic_read_reg64(VNIC_REG_TX_TAIL);
-	struct vnic_rxtx_desc *desc;
+	//struct vnic_rxtx_desc *desc;
+	struct vnic_rxtx_desc *desc = (struct vnic_rxtx_desc *)malloc(sizeof(struct vnic_rxtx_desc));
 
 	VNIC_DEBUG("TX Process started. TX base: 0x%lx\n", tx_desc_base);
 	//printf("Initial TX_HEAD: %lx, TX_TAIL: %lx\n", last_head, tx_tail);
@@ -145,13 +175,17 @@ void tx_process(void) {
 		// 检查是否有新的描述符需要处理
 		if (last_head != tx_tail) {
 			// 计算描述符在映射内存中的位置
-			desc = (struct vnic_rxtx_desc *)(tx_desc_base + last_head * VNIC_DESC_SIZE);
+			//desc = (struct vnic_rxtx_desc *)(tx_desc_base + last_head * VNIC_DESC_SIZE);
+			pread(xdma_c2h_fd, desc, sizeof(struct vnic_rxtx_desc), 
+				FPGA_RESV_MEM_PHYS + VNIC_RESV_TX_DESC + last_head * VNIC_DESC_SIZE);
 			// 检查描述符是否有效
 			if (desc->status & VNIC_DESC_STATUS_VALID) {
 				// 处理数据包
-				process_packet(desc->buf, desc->len);
+				tx_process_packet(desc->buf, desc->len);
 				// 标记描述符为已完成
-				desc->status = VNIC_DESC_STATUS_DONE;
+				//desc->status = VNIC_DESC_STATUS_DONE;
+				pwrite(xdma_h2c_fd, &(uint32_t){VNIC_DESC_STATUS_DONE}, sizeof(uint32_t), 
+					FPGA_RESV_MEM_PHYS + VNIC_RESV_TX_DESC + last_head * VNIC_DESC_SIZE + 0x18);
 				VNIC_DEBUG("Processed TX descriptor %u\n\n", last_head);
 				last_head = (last_head + 1) % VNIC_MAX_QUEUE_DEPTH;
 				__sync_synchronize();
@@ -162,6 +196,43 @@ void tx_process(void) {
 		tx_tail = vnic_read_reg64(VNIC_REG_TX_TAIL);
 	}
 	//vnic_write_reg64(VNIC_REG_TX_HEAD, last_head);
+}
+
+void rx_handler(void) {
+	void *rx_desc_base = vnic_resv_mem_virt + VNIC_RESV_RX_DESC;
+	uint64_t last_head = vnic_read_reg64(VNIC_REG_RX_HEAD);
+	//sleep(1);
+	uint64_t rx_tail = vnic_read_reg64(VNIC_REG_RX_TAIL);
+	struct vnic_rxtx_desc *desc;
+
+	VNIC_DEBUG("RX Process started. RX base: 0x%lx\n", rx_desc_base);
+	//printf("Initial RX_HEAD: %lx, RX_TAIL: %lx\n", last_head, rx_tail);
+	while (1) {
+		// 检查是否有新的描述符需要处理
+		if (last_head != rx_tail) {
+			// 计算描述符在映射内存中的位置
+			//desc = (struct vnic_rxtx_desc *)(tx_desc_base + last_head * VNIC_DESC_SIZE);
+			pread(xdma_c2h_fd, desc, sizeof(struct vnic_rxtx_desc), 
+				FPGA_RESV_MEM_PHYS + VNIC_RESV_RX_DESC + last_head * VNIC_DESC_SIZE);
+			// 检查描述符是否有效
+			if (desc->status & VNIC_DESC_STATUS_VALID) {
+				// 处理数据包
+				rx_process_packet(desc->buf, desc->len);
+				// 标记描述符为已完成
+				//desc->status = VNIC_DESC_STATUS_DONE;
+				pwrite(xdma_h2c_fd, &(uint32_t){VNIC_DESC_STATUS_DONE}, sizeof(uint32_t), 
+					FPGA_RESV_MEM_PHYS + VNIC_RESV_RX_DESC + last_head * VNIC_DESC_SIZE + 0x18);
+				VNIC_DEBUG("Processed RX descriptor %u\n\n", last_head);
+				last_head = (last_head + 1) % VNIC_MAX_QUEUE_DEPTH;
+				__sync_synchronize();
+				vnic_write_reg64(VNIC_REG_RX_HEAD, last_head);
+				//printf("Updated TX_HEAD to %lx\n", last_head);
+			}
+		}
+		rx_tail = vnic_read_reg64(VNIC_REG_RX_TAIL);
+	}
+	//vnic_write_reg64(VNIC_REG_RX_HEAD, last_head);
+
 }
 
 int main()
@@ -187,15 +258,29 @@ int main()
 		return -1;
 	}
 
+	xdma_c2h_fd = open("/dev/xdma0_c2h_0", O_RDWR | O_SYNC);
+	if (xdma_c2h_fd < 0) {
+		perror("Failed to open /dev/xdma0_c2h_0");
+		return -1;
+	}
+
+	xdma_h2c_fd = open("/dev/xdma0_h2c_0", O_RDWR | O_SYNC);
+	if (xdma_h2c_fd < 0) {
+		perror("Failed to open /dev/xdma0_h2c_0");
+		return -1;
+	}
+
 	while (vnic_read_reg64(VNIC_REG_STATUS) == VNIC_STATUS_IDLE)
 		;
 
 	vnic_dump_regs();
 
-	tx_process();
+	rx_handler();
     
 	munmap((void *)vnic_regs_virt, VNIC_REGS_SIZE);
 	close(fd);
+	close(xdma_c2h_fd);
+	close(xdma_h2c_fd);
 
 	return 0;
 }
