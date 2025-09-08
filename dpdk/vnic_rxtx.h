@@ -209,4 +209,5 @@ uint64_t vnic_process_rx_completion(struct vnic_rxtx_desc_queue *rxq)
 	return nb_rx_cmpl;
 }
 
+
 #endif /* VNIC_RXTX_H */

@@ -13,6 +13,7 @@ uint64_t pkt_size = DEFAULT_PKT_SIZE;
 int is_tx_thpt = 0;
 int is_tx_latency = 0;
 int is_rx_thpt = 0;
+int is_fwd = 0;
 
 struct perf_stats {
 	uint64_t total_bytes;      // 总传输字节数
@@ -40,6 +41,9 @@ void parse_args(int argc, char** argv) {
 		}
 		if (strcmp(argv[i], "--tx-lat") == 0) {
 			is_tx_latency = 1;
+		}
+		if (strcmp(argv[i], "--fwd") == 0) {
+			is_fwd = 1;
 		}
 	}
 }
@@ -147,7 +151,7 @@ void vnic_test_tx_latency(struct vnic_rxtx_desc_queue *txq)
 	qsort(latency, rep, sizeof(double), compare_double);
 
 	double percentiles[] = {5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99, 99.5, 99.9};
-    int num_percentiles = sizeof(percentiles) / sizeof(percentiles[0]);
+	int num_percentiles = sizeof(percentiles) / sizeof(percentiles[0]);
 
 	for (i = 0; i < num_percentiles; i++) {
         double value = calculate_percentile(latency, rep, percentiles[i]);
@@ -155,6 +159,69 @@ void vnic_test_tx_latency(struct vnic_rxtx_desc_queue *txq)
     }
 }
 
+void vnic_test_fwd(struct vnic_rxtx_desc_queue *rxq, struct vnic_rxtx_desc_queue *txq, uint64_t nb_pkts, uint64_t pkt_size)
+{
+	printf("starting rx/tx/fwd test\n");
+	uint64_t nb_rx, nb_rx_cmpl = 0, nb_tx_cmpl = 0;
+	uint64_t next_tail, last_head;
+	uint64_t fwd_size = 32;
+	uint64_t to_process_pkts = nb_pkts;
+	int i;
+	struct perf_stats *stats = malloc(sizeof(struct perf_stats));
+	volatile struct vnic_rxtx_desc *tx_desc;
+	last_head = txq->last_head;
+	memset(stats, 0, sizeof(struct perf_stats));
+	stats->start_tsc = rte_rdtsc();
+
+	while (to_process_pkts > 0) {
+		//printf("to_process_pkts %lx, fwd_size %lx\n", to_process_pkts, fwd_size);
+		if (to_process_pkts < fwd_size)
+			fwd_size = to_process_pkts;
+
+		nb_rx = vnic_rx_burst(rxq, fwd_size, pkt_size);
+		//printf("submit %lx packets for rx\n", nb_rx);
+		do {
+			nb_rx_cmpl += vnic_process_rx_completion(rxq);
+		} while (nb_rx_cmpl != nb_rx);
+		//printf("rx completed %lx packets\n", nb_rx_cmpl);
+		for (i = 0; i < fwd_size; i++) {
+			next_tail = (txq->tail + 1) % VNIC_MAX_QUEUE_DEPTH;
+			if (next_tail == last_head) {
+				//printf("TX queue full, stopping at %d packets\n", i);
+				break;
+			}
+			//printf("prepare tx descs\n");
+			tx_desc = (volatile struct vnic_rxtx_desc *)(vnic_resv_mem_virt + VNIC_RESV_TX_DESC + txq->tail * VNIC_DESC_SIZE);
+			tx_desc->buf = (uint64_t)(VNIC_RESV_MEM_PHYS + VNIC_RESV_RX_DATA + (rxq->tail - nb_rx_cmpl) * VNIC_DATA_SIZE);
+			tx_desc->len = pkt_size;
+			tx_desc->status = VNIC_DESC_STATUS_VALID;
+			tx_desc->id = txq->tail;
+			txq->tail = next_tail;
+		}
+		vnic_write_reg64(VNIC_REG_TX_TAIL, txq->tail);
+		//printf("submit %lx packets for tx, new tail %lx\n", fwd_size, txq->tail);
+		do {
+			nb_tx_cmpl += vnic_process_tx_completion(txq);
+		} while (nb_tx_cmpl != fwd_size);
+		
+		to_process_pkts -= fwd_size;
+		nb_rx_cmpl = 0;
+		nb_tx_cmpl = 0;		
+	}
+	stats->end_tsc = rte_rdtsc();
+	stats->total_packets = nb_pkts * 2;
+	stats->total_bytes = nb_pkts * pkt_size * 2;
+	stats->duration_sec = (double)(stats->end_tsc - stats->start_tsc) / rte_get_tsc_hz();
+	stats->bandwidth_mbps = (double)(stats->total_bytes * 8) / (stats->duration_sec * 1e6);
+	stats->packets_per_sec = (double)stats->total_packets / stats->duration_sec;
+	printf("\n===== FWD Throughput Statistics =====\n");
+	printf("Total packets: %" PRIu64 "\n", stats->total_packets);
+	printf("Total bytes: %" PRIu64 " bytes\n", stats->total_bytes);
+	printf("Duration: %.6f seconds\n", stats->duration_sec);
+	printf("Bandwidth: %.3f mbps\n", stats->bandwidth_mbps);
+	printf("Throughput: %.2f packets/sec\n", stats->packets_per_sec);
+	printf("===================================\n");
+}
 
 
 int main(int argc, char *argv[])
@@ -207,6 +274,9 @@ int main(int argc, char *argv[])
 	// TX latency test
 	if (is_tx_latency)
 		vnic_test_tx_latency(txq);
+
+	if (is_fwd)
+		vnic_test_fwd(rxq, txq, burst_size, pkt_size);
 
 	vnic_cleanup_regs();
 	vnic_free_rxtx_queues(rxq);
