@@ -28,8 +28,10 @@ bool debug = 0;
 
 #ifdef FPGA
     #include <asm/kdasics.h>
+    typedef uint32_t vnic_irq_flags_t;
 #else
     #include "xdma.h"
+    typedef unsigned long vnic_irq_flags_t;
 #endif
 
 /*
@@ -174,40 +176,9 @@ static int vnic_get_sharemem_offset(uint64_t *addr)
 }
 #endif
 
-static void vnic_flush_cache(void)
-{
-    #ifdef FPGA
-        return;
-        uint64_t cache_block_size = 64;
-        uint64_t cache_sets = 128;
-        uint64_t cache_size = 32768;
-    #else
-        uint64_t cache_block_size = 64;
-        uint64_t cache_sets = 64;
-        uint64_t cache_size = 49152;
-    #endif
-    uint64_t cache_associativity = cache_size / (cache_block_size * cache_sets);
-    uint8_t *buffer = kmalloc(2 * cache_size, GFP_KERNEL);
-    if (!buffer) {
-        pr_err("Failed to allocate memory for cache flush\n");
-        return;
-    }
-    volatile uint8_t *v_buffer = buffer;
-    int set, way;
-    volatile uint8_t *ptr;
-    for (set = 0; set < cache_sets; set++) {
-        for (way = 0; way < cache_associativity; way++) {
-            // 计算当前目标地址：基址 + 块偏移 + 组偏移 + 路偏移
-            ptr = v_buffer + (set * cache_block_size) + (way * cache_sets * cache_block_size);
-            *ptr = 1;
-        }
-    }
-    kfree(buffer);
-}
-
 static uint64_t vnic_read_share_mem(uint64_t *addr)
 {
-    uint32_t flags;
+    vnic_irq_flags_t flags;
     vnic_lock_irqsave(&read_lock, flags);
     uint64_t val;
     #ifdef FPGA
@@ -216,7 +187,6 @@ static uint64_t vnic_read_share_mem(uint64_t *addr)
 	    uint32_t hi = ioread32((u8 __iomem *)addr + 4);
 	    val = (((uint64_t)hi & 0xFFFFFFFFUL) << 32) | (lo & 0xFFFFFFFFUL);
     */
-        vnic_flush_cache();
         val = readq((void __iomem *)addr);
         mb();
     #else
@@ -226,7 +196,6 @@ static uint64_t vnic_read_share_mem(uint64_t *addr)
         }
         //VNIC_DBG("vnic_read_share_mem: off = 0x%lx, addr = 0x%llx\n", 
         //    (unsigned long)off, (unsigned long long)addr);
-        vnic_flush_cache();
         val = vnic_xdma_read((uint32_t)off);
         mb();
         if (val == (uint64_t)-1) {
@@ -243,7 +212,7 @@ static uint64_t vnic_read_share_mem(uint64_t *addr)
 
 static void vnic_write_share_mem(uint64_t *addr, uint64_t val)
 {
-    uint32_t flags;
+    vnic_irq_flags_t flags;
     vnic_lock_irqsave(&write_lock, flags);
     #ifdef FPGA
     /*
@@ -254,7 +223,6 @@ static void vnic_write_share_mem(uint64_t *addr, uint64_t val)
     */
         writeq(val, (void __iomem *)addr);
         mb();
-        vnic_flush_cache();
     #else
         int off = vnic_get_sharemem_offset(addr);
         if (off < 0) {
@@ -262,7 +230,6 @@ static void vnic_write_share_mem(uint64_t *addr, uint64_t val)
         }
         vnic_xdma_write((uint32_t)off, val);
         mb();
-        vnic_flush_cache();
     #endif
     //VNIC_DBG("vnic_write_share_mem: addr = 0x%llx, val = 0x%llx\n",
     //    (unsigned long long)addr, (unsigned long long)val);
@@ -272,12 +239,11 @@ static void vnic_write_share_mem(uint64_t *addr, uint64_t val)
 
 static void vnic_memcpy_to_share_mem(void *addr, void *data, size_t len)
 {
-    uint32_t flags;
+    vnic_irq_flags_t flags;
     vnic_lock_irqsave(&write_lock, flags);
     #ifdef FPGA
         memcpy(addr, data, len);
         mb();
-        vnic_flush_cache();
     #else
         int off = vnic_get_sharemem_offset(addr);
         if (off < 0) {
@@ -285,17 +251,15 @@ static void vnic_memcpy_to_share_mem(void *addr, void *data, size_t len)
         }
         vnic_xdma_memcpy_to_share_mem((uint32_t)off, data, len);
         mb();
-        vnic_flush_cache();
     #endif
     vnic_unlock_irqrestore(&write_lock, flags);
 }
 
 static void vnic_memcpy_from_share_mem(void *addr, void *data, size_t len)
 {
-    uint32_t flags;
+    vnic_irq_flags_t flags;
     vnic_lock_irqsave(&read_lock, flags);
     #ifdef FPGA
-        vnic_flush_cache();
         memcpy(data, addr, len);
         mb();
     #else
@@ -303,7 +267,6 @@ static void vnic_memcpy_from_share_mem(void *addr, void *data, size_t len)
         if (off < 0) {
             return;
         }
-        vnic_flush_cache();
         vnic_xdma_memcpy_from_share_mem((uint32_t)off, data, len);
         mb();
     #endif

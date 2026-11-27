@@ -3,13 +3,16 @@
 /* 网络设备操作函数 */
 static netdev_tx_t vnic_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-    uint32_t flags;
+    vnic_irq_flags_t flags;
     vnic_lock_irqsave(&tx_lock, flags);
     skb_tx_timestamp(skb);
     
     if (skb_is_nonlinear(skb)) {
         if (skb_linearize(skb) != 0) {
-            //dev_kfree_skb(skb);
+#ifndef FPGA
+            vnic_unlock_irqrestore(&tx_lock, flags);
+            dev_kfree_skb_any(skb);
+#endif
             pr_err("skb_linearize failed\n");
             return NETDEV_TX_OK;
         }
@@ -34,7 +37,7 @@ static int vnic_poll_rx(void *data)
             msleep(1); // 如果设备未打开，休眠1毫秒降低CPU占用
             continue; // 跳过本次循环
         }
-        uint32_t flags;
+        vnic_irq_flags_t flags;
         spin_lock_irqsave(&rx_lock, flags);
         ret = vnic_recv_packet();
         spin_unlock_irqrestore(&rx_lock, flags);       
@@ -42,9 +45,7 @@ static int vnic_poll_rx(void *data)
             pr_err("Failed to receive packet: %d\n", ret);
             return -EIO; // 如果接收失败，继续下一次循环
         }
-        #ifdef FPGA
-            msleep(1);  
-        #endif
+        msleep(1);
     }
     return 0;
 }
@@ -91,7 +92,7 @@ static void vnic_setup(struct net_device *dev)
     #ifdef FPGA
         memcpy(dev->dev_addr, RV_MAC, ETH_ALEN);
     #else
-        memcpy(dev->dev_addr, X86_MAC, ETH_ALEN);
+        eth_hw_addr_set(dev, X86_MAC);
     #endif
     
     if (vnic_init_share_mem()) {
@@ -127,14 +128,24 @@ static int __init vnic_init(void)
     return 0;
 }
 
-static void __exit vnic_exit(void)
+static void vnic_stop_polling(void)
 {
-    unregister_netdev(vnic_dev);
-    free_netdev(vnic_dev);
     if (polling_thread) {
         kthread_stop(polling_thread);
         polling_thread = NULL;
     }
+}
+
+static void __exit vnic_exit(void)
+{
+#ifndef FPGA
+    vnic_stop_polling();
+#endif
+    unregister_netdev(vnic_dev);
+    free_netdev(vnic_dev);
+#ifdef FPGA
+    vnic_stop_polling();
+#endif
     vnic_deinit_share_mem();
     pr_info("Virtual network device unregistered\n");
 }
