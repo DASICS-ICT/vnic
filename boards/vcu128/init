@@ -1,0 +1,10 @@
+#!/bin/busybox sh
+export PATH=/bin:/sbin
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+if [ -d /sys/class/net/vnic0 ] && [ -e /proc/device-tree/reserved-memory/my_reserved@f8000000/reg ]; then
+    ip addr add 192.0.2.2/30 dev vnic0 && ip link set vnic0 up && echo VNIC_DUT_READY
+fi
+exec /bin/sh
