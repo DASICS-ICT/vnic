@@ -4,6 +4,8 @@
 
 ## 硬件参考
 
+S2C VU19P 有独立的板级设计，见 [19P 硬件参考](../s2c_vu19p/README.md)。
+
 实测 SoC 对应 NexST 的 `vcu128-vnic-coherent-v1` 标签（`1fba14d`，单核 `vcu128_orig`）。本目录的 `xiangshan.tcl` 是该版本的 Vivado 2020.2 板级 Block Design 脚本原件，完整工程提供它引用的 RTL 模块。[板级 Tcl](xiangshan.tcl) · [NexST 硬件版本](https://github.com/DASICS-ICT/nexst/tree/vcu128-vnic-coherent-v1)
 
 主机对 BAR2 的读写由 `xdma_ep/M_AXI_BYPASS` 发出，经 `axi_ic_dma` 和 `axi_register_slice_dma` 到达 `u_role/s_axi_dma`。role 内部再经位宽转换器接到香山的 `xs_top/dma_0`，供两端访问 coherent 共享队列。BAR2 偏移 0 对应 FPGA 地址 `0xf0000000`。XDMA 的常规 `M_AXI` 则经 `axi_ic_ddr_mem` 接到 DDR4 MIG。[role 内部接线](https://github.com/DASICS-ICT/nexst/blob/vcu128-vnic-coherent-v1/nanhu-g/fpga/wrapper/proto.tcl#L162-L166)
