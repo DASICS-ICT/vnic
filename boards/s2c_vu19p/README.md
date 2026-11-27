@@ -1,6 +1,6 @@
 # S2C VU19P 虚拟网卡硬件参考
 
-NexST 标签 `s2c-vu19p-vnic-coherent-v1`（`7959856`）记录了生成 19P bit 时使用的 SoC。本目录的 Tcl 与该版本的 `shell/s2c_vu19p/fpga/scripts/xiangshan.tcl` 逐字节一致。[板级 Tcl](xiangshan.tcl) · [NexST 硬件版本](https://github.com/DASICS-ICT/nexst/tree/s2c-vu19p-vnic-coherent-v1)
+S2C VU19P 和 VCU128 共用 NexST 硬件标签 `vnic-coherent-v1`（`7959856`），其中的 19P 板级 Tcl 用于生成该板的 bit。本目录的 Tcl 与该版本的 `shell/s2c_vu19p/fpga/scripts/xiangshan.tcl` 逐字节一致。[板级 Tcl](xiangshan.tcl) · [NexST 硬件版本](https://github.com/DASICS-ICT/nexst/tree/vnic-coherent-v1)
 
 | XDMA 接口 | 19P 上的连接和用途 |
 |---|---|
