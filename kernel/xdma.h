@@ -1,4 +1,4 @@
-#include <xdma/libxdma_api.h>
+#include "../xdma/include/libxdma_api.h"
 #include <linux/string.h>
 #include <linux/io.h>
 

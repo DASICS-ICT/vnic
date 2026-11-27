@@ -23,7 +23,7 @@ ip addr show dev vnic0
 
 ## 主机配置
 
-主机需要与当前内核匹配的专用 `xdma.ko`，它向 vNIC 驱动提供 `xdma_read64_bar` 和 `xdma_write64_bar`。从本仓库根目录编译两个模块。主机需装有当前内核的构建文件，且编译器能找到 `<xdma/libxdma_api.h>`。
+主机需安装与运行内核匹配的内核头文件和模块构建工具。XDMA 接口头文件已随本仓库提供。从仓库根目录先编译专用 `xdma.ko`，再用它生成的 `Module.symvers` 编译 `vnic.ko`。
 
 ```bash
 XDMA="$PWD/xdma/xdma"
